@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo } from "react";
+import { createClient } from "@supabase/supabase-js";
 import { BedDouble, BedSingle, CalendarDays, Home, Plus, Trash2, Users, Check, X, DoorOpen } from "lucide-react";
 
 // ---------- utilidades de fechas ----------
@@ -18,7 +19,24 @@ const noches = (a, b) => Math.max(0, Math.round((new Date(b) - new Date(a)) / 86
 // dos rangos [in, out) se cruzan
 const seCruzan = (aIn, aOut, bIn, bOut) => aIn < bOut && bIn < aOut;
 
-const STORAGE_KEY = "hostal-datos";
+// ---------- conexión a Supabase ----------
+// Las credenciales se leen de variables de entorno (archivo .env en local, Settings en Vercel)
+const supabase = createClient(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY
+);
+
+// mapeo entre columnas de la base (snake_case) y el formato de la app (camelCase)
+const reservaDesdeDb = (r) => ({
+  id: r.id,
+  huesped: r.huesped,
+  habitacionId: r.habitacion_id,
+  camaIds: r.cama_ids,
+  habitacionCompleta: r.habitacion_completa,
+  entrada: r.entrada,
+  salida: r.salida,
+  creada: r.creada,
+});
 
 export default function AppReservasHostal() {
   const [datos, setDatos] = useState({ habitaciones: [], reservas: [] });
@@ -26,51 +44,64 @@ export default function AppReservasHostal() {
   const [tab, setTab] = useState("reservar");
   const [aviso, setAviso] = useState(null);
 
-  // ---- cargar / guardar ----
-  useEffect(() => {
-    try {
-      const r = localStorage.getItem(STORAGE_KEY);
-      if (r) setDatos(JSON.parse(r));
-    } catch (e) {
-      /* aún no hay datos guardados o están corruptos */
-    }
-    setCargando(false);
-  }, []);
-
-  const guardar = (nuevos) => {
-    setDatos(nuevos);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(nuevos));
-    } catch (e) {
-      mostrarAviso("No se pudo guardar. Intenta de nuevo.", true);
-    }
-  };
-
   const mostrarAviso = (texto, error = false) => {
     setAviso({ texto, error });
     setTimeout(() => setAviso(null), 3000);
   };
 
+  // ---- cargar todo desde la base ----
+  const cargarDatos = async () => {
+    const [habs, ress] = await Promise.all([
+      supabase.from("habitaciones").select("*").order("creada"),
+      supabase.from("reservas").select("*"),
+    ]);
+    if (habs.error || ress.error) {
+      mostrarAviso("Error cargando datos. Revisa tu conexión.", true);
+      return;
+    }
+    setDatos({
+      habitaciones: habs.data.map((h) => ({ id: h.id, nombre: h.nombre, camas: h.camas })),
+      reservas: ress.data.map(reservaDesdeDb),
+    });
+  };
+
+  useEffect(() => {
+    (async () => {
+      await cargarDatos();
+      setCargando(false);
+    })();
+    // tiempo real: cuando otro dispositivo cambia algo, recargamos
+    const canal = supabase
+      .channel("cambios-hostal")
+      .on("postgres_changes", { event: "*", schema: "public", table: "habitaciones" }, cargarDatos)
+      .on("postgres_changes", { event: "*", schema: "public", table: "reservas" }, cargarDatos)
+      .subscribe();
+    return () => supabase.removeChannel(canal);
+  }, []);
+
   // ---- habitaciones ----
-  const crearHabitacion = (nombre, numCamas) => {
+  const crearHabitacion = async (nombre, numCamas) => {
     const id = "h" + Date.now();
     const camas = Array.from({ length: numCamas }, (_, i) => ({
       id: id + "-c" + (i + 1),
       etiqueta: "Cama " + (i + 1),
     }));
-    guardar({ ...datos, habitaciones: [...datos.habitaciones, { id, nombre, camas }] });
+    const { error } = await supabase.from("habitaciones").insert({ id, nombre, camas });
+    if (error) return mostrarAviso("No se pudo crear la habitación.", true);
+    await cargarDatos();
     mostrarAviso(`Habitación "${nombre}" creada con ${numCamas} camas`);
   };
 
-  const eliminarHabitacion = (id) => {
-    guardar({
-      habitaciones: datos.habitaciones.filter((h) => h.id !== id),
-      reservas: datos.reservas.filter((r) => r.habitacionId !== id),
-    });
+  const eliminarHabitacion = async (id) => {
+    // primero sus reservas, luego la habitación
+    const r1 = await supabase.from("reservas").delete().eq("habitacion_id", id);
+    const r2 = await supabase.from("habitaciones").delete().eq("id", id);
+    if (r1.error || r2.error) return mostrarAviso("No se pudo eliminar.", true);
+    await cargarDatos();
     mostrarAviso("Habitación eliminada");
   };
 
-  const crearEjemplo = () => {
+  const crearEjemplo = async () => {
     const base = Date.now();
     const mk = (nombre, n, off) => {
       const id = "h" + (base + off);
@@ -80,15 +111,13 @@ export default function AppReservasHostal() {
         camas: Array.from({ length: n }, (_, i) => ({ id: id + "-c" + (i + 1), etiqueta: "Cama " + (i + 1) })),
       };
     };
-    guardar({
-      ...datos,
-      habitaciones: [
-        ...datos.habitaciones,
-        mk("Dormitorio Andes", 6, 1),
-        mk("Dormitorio Caribe", 4, 2),
-        mk("Privada Monserrate", 2, 3),
-      ],
-    });
+    const { error } = await supabase.from("habitaciones").insert([
+      mk("Dormitorio Andes", 6, 1),
+      mk("Dormitorio Caribe", 4, 2),
+      mk("Privada Monserrate", 2, 3),
+    ]);
+    if (error) return mostrarAviso("No se pudieron crear los ejemplos.", true);
+    await cargarDatos();
     mostrarAviso("Habitaciones de ejemplo creadas");
   };
 
@@ -103,13 +132,41 @@ export default function AppReservasHostal() {
     return ocupadas;
   };
 
-  const crearReserva = (reserva) => {
-    guardar({ ...datos, reservas: [...datos.reservas, { ...reserva, id: "r" + Date.now() }] });
+  const crearReserva = async (reserva) => {
+    // verificación final contra la base para evitar dobles reservas simultáneas
+    const { data: recientes, error: errCheck } = await supabase
+      .from("reservas")
+      .select("*")
+      .eq("habitacion_id", reserva.habitacionId);
+    if (errCheck) return mostrarAviso("Error de conexión. Intenta de nuevo.", true);
+    const conflicto = recientes.some(
+      (r) =>
+        seCruzan(reserva.entrada, reserva.salida, r.entrada, r.salida) &&
+        r.cama_ids.some((c) => reserva.camaIds.includes(c))
+    );
+    if (conflicto) {
+      await cargarDatos();
+      return mostrarAviso("Alguien acaba de reservar una de esas camas. Revisa de nuevo.", true);
+    }
+    const { error } = await supabase.from("reservas").insert({
+      id: "r" + Date.now() + Math.random().toString(36).slice(2, 6),
+      huesped: reserva.huesped,
+      habitacion_id: reserva.habitacionId,
+      cama_ids: reserva.camaIds,
+      habitacion_completa: reserva.habitacionCompleta,
+      entrada: reserva.entrada,
+      salida: reserva.salida,
+      creada: reserva.creada,
+    });
+    if (error) return mostrarAviso("No se pudo guardar la reserva.", true);
+    await cargarDatos();
     mostrarAviso("Reserva confirmada para " + reserva.huesped);
   };
 
-  const cancelarReserva = (id) => {
-    guardar({ ...datos, reservas: datos.reservas.filter((r) => r.id !== id) });
+  const cancelarReserva = async (id) => {
+    const { error } = await supabase.from("reservas").delete().eq("id", id);
+    if (error) return mostrarAviso("No se pudo cancelar.", true);
+    await cargarDatos();
     mostrarAviso("Reserva cancelada");
   };
 
